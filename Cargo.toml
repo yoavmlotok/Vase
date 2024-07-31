@@ -1,0 +1,16 @@
+[package]
+name = "oRithm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vulkano = "0.34.1"
+vulkano-shaders = "0.34.0"
+bytemuck = "1.16.1"
+
+wayland-client = "0.31.5"
+wayland-protocols = { version = "0.32.3", features = ["client"] }
+tempfile = "3.10.1"
+
+[profile.dev]
+opt-level = 1
