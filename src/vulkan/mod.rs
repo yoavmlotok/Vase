@@ -20,24 +20,36 @@ use vulkano::{
         AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
     },
     pipeline::{
-        compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo,
-        ComputePipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+        compute::ComputePipelineCreateInfo,
+        graphics::{
+            color_blend::{ColorBlendAttachmentState, ColorBlendState},
+            input_assembly::InputAssemblyState,
+            multisample::MultisampleState,
+            rasterization::RasterizationState,
+            vertex_input::VertexInputState,
+            viewport::{Viewport, ViewportState},
+            GraphicsPipelineCreateInfo,
+        },
+        layout::PipelineDescriptorSetLayoutCreateInfo,
+        ComputePipeline, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
     },
+    render_pass::{RenderPass, Subpass},
     shader::ShaderModule,
     sync::{self, GpuFuture},
     Validated, VulkanError, VulkanLibrary,
 };
+use wayland_client::backend::smallvec::SmallVec;
 
-pub struct Processor {
+pub struct VulkanProcessor {
     device: Arc<Device>,
     graphics_queue: Arc<Queue>,
     memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: StandardCommandBufferAllocator,
 }
 
-impl Processor {
+impl VulkanProcessor {
     pub fn new() -> Self {
-        println!("Creating new processor.");
+        println!("Creating new vulkan processor.");
         let creation_start = Instant::now();
 
         let library = VulkanLibrary::new().expect("No local Vulkan library/DLL.");
@@ -96,11 +108,11 @@ impl Processor {
         let graphics_queue = queues.next().unwrap();
 
         println!(
-            "Processor creation completed in {} milliseconds. \n",
+            "Vulkan processor creation completed in {} milliseconds. \n",
             creation_start.elapsed().as_millis()
         );
 
-        return Processor {
+        return VulkanProcessor {
             device,
             graphics_queue,
             memory_allocator,
@@ -178,6 +190,140 @@ impl Processor {
         .unwrap()
     }
 
+    pub fn create_render_pass(&self, format: Format) -> Arc<RenderPass> {
+        vulkano::single_pass_renderpass!(
+            self.device.clone(),
+            attachments: {
+                color: {
+                    format: format,
+                    samples: 1,
+                    load_op: Clear,
+                    store_op: Store,
+                },
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {},
+            },
+        )
+        .unwrap()
+    }
+
+    pub fn create_pipeline_stages_layout<T>(
+        &self,
+        load_functions: Vec<T>,
+    ) -> (Vec<PipelineShaderStageCreateInfo>, Arc<PipelineLayout>)
+    where
+        T: Fn(Arc<Device>) -> Result<Arc<ShaderModule>, Validated<VulkanError>>,
+    {
+        let mut stages: Vec<PipelineShaderStageCreateInfo> = vec![];
+
+        for load_function in load_functions {
+            stages.push(PipelineShaderStageCreateInfo::new(
+                load_function(self.device.clone())
+                    .expect("Failed to create shader module.")
+                    .entry_point("main")
+                    .unwrap(),
+            ));
+        }
+
+        let layout = PipelineLayout::new(
+            self.device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(
+                stages
+                    .iter()
+                    .collect::<Vec<&PipelineShaderStageCreateInfo>>(),
+            )
+            .into_pipeline_layout_create_info(self.device.clone())
+            .unwrap(),
+        )
+        .expect("Failed to create pipeline layout.");
+
+        return (stages, layout);
+    }
+
+    pub fn create_compute_pipeline(
+        &self,
+        stage: PipelineShaderStageCreateInfo,
+        layout: Arc<PipelineLayout>,
+    ) -> Arc<ComputePipeline> {
+        return ComputePipeline::new(
+            self.device.clone(),
+            None,
+            ComputePipelineCreateInfo::stage_layout(stage, layout),
+        )
+        .expect("Failed to create compute pipeline.");
+    }
+
+    pub fn create_graphics_pipeline(
+        &self,
+        (stages, layout): (Vec<PipelineShaderStageCreateInfo>, Arc<PipelineLayout>),
+        vertex_input_state: VertexInputState,
+        viewport: Viewport,
+        subpass: Subpass,
+    ) -> Arc<GraphicsPipeline> {
+        GraphicsPipeline::new(
+            self.device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: SmallVec::from_vec(stages),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState {
+                    viewports: [viewport].into_iter().collect(),
+                    ..Default::default()
+                }),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    subpass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .unwrap()
+    }
+
+    pub fn create_compute_descriptor_set(
+        &self,
+        compute_pipeline: Arc<ComputePipeline>,
+        write_descriptor_sets: impl IntoIterator<Item = WriteDescriptorSet>,
+    ) -> Arc<PersistentDescriptorSet> {
+        return PersistentDescriptorSet::new(
+            &StandardDescriptorSetAllocator::new(self.device.clone(), Default::default()),
+            compute_pipeline
+                .layout()
+                .set_layouts()
+                .get(0)
+                .unwrap()
+                .clone(),
+            write_descriptor_sets,
+            [],
+        )
+        .expect("Failed to create descriptor set.");
+    }
+
+    pub fn create_graphics_descriptor_set(
+        &self,
+        graphics_pipeline: Arc<GraphicsPipeline>,
+        write_descriptor_sets: impl IntoIterator<Item = WriteDescriptorSet>,
+    ) -> Arc<PersistentDescriptorSet> {
+        return PersistentDescriptorSet::new(
+            &StandardDescriptorSetAllocator::new(self.device.clone(), Default::default()),
+            graphics_pipeline
+                .layout()
+                .set_layouts()
+                .get(0)
+                .unwrap()
+                .clone(),
+            write_descriptor_sets,
+            [],
+        )
+        .expect("Failed to create descriptor set.");
+    }
+
     pub fn create_command_buffer<T>(
         &self,
         builder_fn: T,
@@ -206,54 +352,6 @@ impl Processor {
             .unwrap()
             .wait(None)
             .unwrap();
-    }
-
-    pub fn create_compute_pipeline<T>(&self, load_fn: T) -> Arc<ComputePipeline>
-    where
-        T: Fn(Arc<Device>) -> Result<Arc<ShaderModule>, Validated<VulkanError>>,
-    {
-        let shader = load_fn(self.device.clone()).expect("Failed to create shader module.");
-        let stage = PipelineShaderStageCreateInfo::new(shader.entry_point("main").unwrap());
-        let layout = self.create_pipeline_layout([&stage]);
-
-        return ComputePipeline::new(
-            self.device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .expect("Failed to create compute pipeline.");
-    }
-
-    fn create_pipeline_layout<'a>(
-        &self,
-        stages: impl IntoIterator<Item = &'a PipelineShaderStageCreateInfo>,
-    ) -> Arc<PipelineLayout> {
-        return PipelineLayout::new(
-            self.device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(stages)
-                .into_pipeline_layout_create_info(self.device.clone())
-                .unwrap(),
-        )
-        .expect("Failed to create pipeline layout.");
-    }
-
-    pub fn create_descriptor_set(
-        &self,
-        compute_pipeline: Arc<ComputePipeline>,
-        write_descriptor_sets: impl IntoIterator<Item = WriteDescriptorSet>,
-    ) -> Arc<PersistentDescriptorSet> {
-        return PersistentDescriptorSet::new(
-            &StandardDescriptorSetAllocator::new(self.device.clone(), Default::default()),
-            compute_pipeline
-                .layout()
-                .set_layouts()
-                .get(0)
-                .unwrap()
-                .clone(),
-            write_descriptor_sets,
-            [],
-        )
-        .expect("Failed to create descriptor set.");
     }
 
     #[cfg(debug_assertions)]

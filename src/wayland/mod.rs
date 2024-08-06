@@ -1,4 +1,4 @@
-use std::{cmp::min, fs::File, io::Write, os::fd::AsFd};
+use std::{fs::File, os::fd::AsFd};
 
 use settings::{NAME, SIZE};
 use wayland_client::{
@@ -21,11 +21,12 @@ use wayland_protocols::xdg::shell::client::{
     xdg_wm_base::{self, XdgWmBase},
 };
 
-mod settings;
+pub mod settings;
 
 struct State {
     running: bool,
     base_surface: Option<WlSurface>,
+    buffer_file: File,
     buffer: Option<WlBuffer>,
     wm_base: Option<XdgWmBase>,
     xdg_surface: Option<(XdgSurface, XdgToplevel)>,
@@ -62,11 +63,8 @@ impl Dispatch<WlRegistry, ()> for State {
                     "wl_shm" => {
                         let wl_shm = proxy.bind::<WlShm, _, _>(name, version, queue_handle, ());
 
-                        let mut file = tempfile::tempfile().unwrap();
-                        draw(&mut file, SIZE);
-
                         let pool = wl_shm.create_pool(
-                            file.as_fd(),
+                            state.buffer_file.as_fd(),
                             (SIZE.0 * SIZE.1 * 4) as i32,
                             queue_handle,
                             (),
@@ -219,28 +217,13 @@ impl State {
     }
 }
 
-fn draw(tmp: &mut File, (buf_x, buf_y): (u32, u32)) {
-    let mut buf = std::io::BufWriter::new(tmp);
-    for y in 0..buf_y {
-        for x in 0..buf_x {
-            let a = 0xFF;
-            let r = min(((buf_x - x) * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
-            let g = min((x * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
-            let b = min(((buf_x - x) * 0xFF) / buf_x, (y * 0xFF) / buf_y);
-            buf.write_all(&[b as u8, g as u8, r as u8, a as u8])
-                .unwrap();
-        }
-    }
-    buf.flush().unwrap();
-}
-
 pub struct WaylandClient {
     event_queue: EventQueue<State>,
     state: State,
 }
 
 impl WaylandClient {
-    pub fn new() -> Self {
+    pub fn new<T: Fn(&File)>(graphics_function: T) -> Self {
         let connection = Connection::connect_to_env().expect("Couldn't connect to wayland server.");
 
         let event_queue = connection.new_event_queue();
@@ -249,6 +232,7 @@ impl WaylandClient {
 
         let state = State {
             running: true,
+            buffer_file: tempfile::tempfile().unwrap(),
             base_surface: None,
             buffer: None,
             wm_base: None,
@@ -256,11 +240,13 @@ impl WaylandClient {
             configured: false,
         };
 
+        graphics_function(&state.buffer_file);
+
         return WaylandClient { event_queue, state };
     }
 
     pub fn run(&mut self) {
-        println!("Start:");
+        println!("Start: \n");
         while self.state.running {
             let _ = self.event_queue.blocking_dispatch(&mut self.state);
         }
